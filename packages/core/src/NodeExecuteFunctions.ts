@@ -13,13 +13,7 @@ import type {
 	OAuth2CredentialData,
 } from '@n8n/client-oauth2';
 import { ClientOAuth2 } from '@n8n/client-oauth2';
-import type {
-	AxiosError,
-	AxiosHeaders,
-	AxiosPromise,
-	AxiosRequestConfig,
-	AxiosResponse,
-} from 'axios';
+import type { AxiosError, AxiosHeaders, AxiosRequestConfig, AxiosResponse } from 'axios';
 import axios from 'axios';
 import crypto, { createHmac } from 'crypto';
 import FileType from 'file-type';
@@ -60,9 +54,7 @@ import type {
 	IPollFunctions,
 	IRequestOptions,
 	IRunExecutionData,
-	ITaskData,
 	ITaskDataConnections,
-	ITaskMetadata,
 	ITriggerFunctions,
 	IWebhookData,
 	IWebhookDescription,
@@ -85,9 +77,9 @@ import type {
 	DeduplicationScope,
 	DeduplicationItemTypes,
 	ICheckProcessedContextData,
-	ISupplyDataFunctions,
 	WebhookType,
 	SchedulingFunctions,
+	SupplyData,
 } from 'n8n-workflow';
 import {
 	NodeConnectionType,
@@ -748,6 +740,26 @@ export async function binaryToString(body: Buffer | Readable, encoding?: string)
 	return iconv.decode(buffer, encoding ?? 'utf-8');
 }
 
+export async function invokeAxios(
+	axiosConfig: AxiosRequestConfig,
+	authOptions: IRequestOptions['auth'] = {},
+) {
+	try {
+		return await axios(axiosConfig);
+	} catch (error) {
+		if (authOptions.sendImmediately !== false || !(error instanceof axios.AxiosError)) throw error;
+		// for digest-auth
+		const { response } = error;
+		if (response?.status !== 401 || !response.headers['www-authenticate']?.includes('nonce')) {
+			throw error;
+		}
+		const { auth } = axiosConfig;
+		delete axiosConfig.auth;
+		axiosConfig = digestAuthAxiosConfig(axiosConfig, response, auth);
+		return await axios(axiosConfig);
+	}
+}
+
 export async function proxyRequestToAxios(
 	workflow: Workflow | undefined,
 	additionalData: IWorkflowExecuteAdditionalData | undefined,
@@ -768,29 +780,8 @@ export async function proxyRequestToAxios(
 
 	axiosConfig = Object.assign(axiosConfig, await parseRequestObject(configObject));
 
-	let requestFn: () => AxiosPromise;
-	if (configObject.auth?.sendImmediately === false) {
-		// for digest-auth
-		requestFn = async () => {
-			try {
-				return await axios(axiosConfig);
-			} catch (error) {
-				const { response } = error;
-				if (response?.status !== 401 || !response.headers['www-authenticate']?.includes('nonce')) {
-					throw error;
-				}
-				const { auth } = axiosConfig;
-				delete axiosConfig.auth;
-				axiosConfig = digestAuthAxiosConfig(axiosConfig, response, auth);
-				return await axios(axiosConfig);
-			}
-		};
-	} else {
-		requestFn = async () => await axios(axiosConfig);
-	}
-
 	try {
-		const response = await requestFn();
+		const response = await invokeAxios(axiosConfig, configObject.auth);
 		let body = response.data;
 		if (body instanceof IncomingMessage && axiosConfig.responseType === 'stream') {
 			parseIncomingMessage(body);
@@ -982,7 +973,7 @@ export async function httpRequest(
 ): Promise<IN8nHttpFullResponse | IN8nHttpResponse> {
 	removeEmptyBody(requestOptions);
 
-	let axiosRequest = convertN8nRequestToAxios(requestOptions);
+	const axiosRequest = convertN8nRequestToAxios(requestOptions);
 	if (
 		axiosRequest.data === undefined ||
 		(axiosRequest.method !== undefined && axiosRequest.method.toUpperCase() === 'GET')
@@ -990,23 +981,7 @@ export async function httpRequest(
 		delete axiosRequest.data;
 	}
 
-	let result: AxiosResponse<any>;
-	try {
-		result = await axios(axiosRequest);
-	} catch (error) {
-		if (requestOptions.auth?.sendImmediately === false) {
-			const { response } = error;
-			if (response?.status !== 401 || !response.headers['www-authenticate']?.includes('nonce')) {
-				throw error;
-			}
-
-			const { auth } = axiosRequest;
-			delete axiosRequest.auth;
-			axiosRequest = digestAuthAxiosConfig(axiosRequest, response, auth);
-			result = await axios(axiosRequest);
-		}
-		throw error;
-	}
+	const result = await invokeAxios(axiosRequest, requestOptions.auth);
 
 	if (requestOptions.returnFullResponse) {
 		return {
@@ -2044,143 +2019,39 @@ export function getWebhookDescription(
 	return undefined;
 }
 
-// TODO: Change options to an object
-export const addExecutionDataFunctions = async (
-	type: 'input' | 'output',
-	nodeName: string,
-	data: INodeExecutionData[][] | ExecutionBaseError,
-	runExecutionData: IRunExecutionData,
-	connectionType: NodeConnectionType,
-	additionalData: IWorkflowExecuteAdditionalData,
-	sourceNodeName: string,
-	sourceNodeRunIndex: number,
-	currentNodeRunIndex: number,
-	metadata?: ITaskMetadata,
-): Promise<void> => {
-	if (connectionType === NodeConnectionType.Main) {
-		throw new ApplicationError('Setting type is not supported for main connection', {
-			extra: { type },
-		});
-	}
-
-	let taskData: ITaskData | undefined;
-	if (type === 'input') {
-		taskData = {
-			startTime: new Date().getTime(),
-			executionTime: 0,
-			executionStatus: 'running',
-			source: [null],
-		};
-	} else {
-		// At the moment we expect that there is always an input sent before the output
-		taskData = get(
-			runExecutionData,
-			['resultData', 'runData', nodeName, currentNodeRunIndex],
-			undefined,
-		);
-		if (taskData === undefined) {
-			return;
-		}
-		taskData.metadata = metadata;
-	}
-	taskData = taskData!;
-
-	if (data instanceof Error) {
-		taskData.executionStatus = 'error';
-		taskData.error = data;
-	} else {
-		if (type === 'output') {
-			taskData.executionStatus = 'success';
-		}
-		taskData.data = {
-			[connectionType]: data,
-		} as ITaskDataConnections;
-	}
-
-	if (type === 'input') {
-		if (!(data instanceof Error)) {
-			taskData.inputOverride = {
-				[connectionType]: data,
-			} as ITaskDataConnections;
-		}
-
-		if (!runExecutionData.resultData.runData.hasOwnProperty(nodeName)) {
-			runExecutionData.resultData.runData[nodeName] = [];
-		}
-
-		runExecutionData.resultData.runData[nodeName][currentNodeRunIndex] = taskData;
-		if (additionalData.sendDataToUI) {
-			additionalData.sendDataToUI('nodeExecuteBefore', {
-				executionId: additionalData.executionId,
-				nodeName,
-			});
-		}
-	} else {
-		// Outputs
-		taskData.executionTime = new Date().getTime() - taskData.startTime;
-
-		if (additionalData.sendDataToUI) {
-			additionalData.sendDataToUI('nodeExecuteAfter', {
-				executionId: additionalData.executionId,
-				nodeName,
-				data: taskData,
-			});
-		}
-
-		if (get(runExecutionData, 'executionData.metadata', undefined) === undefined) {
-			runExecutionData.executionData!.metadata = {};
-		}
-
-		let sourceTaskData = get(runExecutionData, ['executionData', 'metadata', sourceNodeName]);
-
-		if (!sourceTaskData) {
-			runExecutionData.executionData!.metadata[sourceNodeName] = [];
-			sourceTaskData = runExecutionData.executionData!.metadata[sourceNodeName];
-		}
-
-		if (!sourceTaskData[sourceNodeRunIndex]) {
-			sourceTaskData[sourceNodeRunIndex] = {
-				subRun: [],
-			};
-		}
-
-		sourceTaskData[sourceNodeRunIndex]!.subRun!.push({
-			node: nodeName,
-			runIndex: currentNodeRunIndex,
-		});
-	}
-};
-
 export async function getInputConnectionData(
 	this: IAllExecuteFunctions,
 	workflow: Workflow,
 	runExecutionData: IRunExecutionData,
-	runIndex: number,
+	parentRunIndex: number,
 	connectionInputData: INodeExecutionData[],
-	inputData: ITaskDataConnections,
+	parentInputData: ITaskDataConnections,
 	additionalData: IWorkflowExecuteAdditionalData,
 	executeData: IExecuteData,
 	mode: WorkflowExecuteMode,
 	closeFunctions: CloseFunction[],
-	inputName: NodeConnectionType,
+	connectionType: NodeConnectionType,
 	itemIndex: number,
 	abortSignal?: AbortSignal,
 ): Promise<unknown> {
-	const node = this.getNode();
-	const nodeType = workflow.nodeTypes.getByNameAndVersion(node.type, node.typeVersion);
+	const parentNode = this.getNode();
+	const parentNodeType = workflow.nodeTypes.getByNameAndVersion(
+		parentNode.type,
+		parentNode.typeVersion,
+	);
 
-	const inputs = NodeHelpers.getNodeInputs(workflow, node, nodeType.description);
+	const inputs = NodeHelpers.getNodeInputs(workflow, parentNode, parentNodeType.description);
 
 	let inputConfiguration = inputs.find((input) => {
 		if (typeof input === 'string') {
-			return input === inputName;
+			return input === connectionType;
 		}
-		return input.type === inputName;
+		return input.type === connectionType;
 	});
 
 	if (inputConfiguration === undefined) {
 		throw new ApplicationError('Node does not have input of type', {
-			extra: { nodeName: node.name, inputName },
+			extra: { nodeName: parentNode.name, connectionType },
 		});
 	}
 
@@ -2190,28 +2061,39 @@ export async function getInputConnectionData(
 		} as INodeInputConfiguration;
 	}
 
-	const parentNodes = workflow.getParentNodes(node.name, inputName, 1);
-	if (parentNodes.length === 0) {
+	const connectedNodes = workflow
+		.getParentNodes(parentNode.name, connectionType, 1)
+		.map((nodeName) => workflow.getNode(nodeName) as INode)
+		.filter((connectedNode) => connectedNode.disabled !== true);
+
+	if (connectedNodes.length === 0) {
 		if (inputConfiguration.required) {
 			throw new NodeOperationError(
-				node,
-				`A ${inputConfiguration?.displayName ?? inputName} sub-node must be connected`,
+				parentNode,
+				`A ${inputConfiguration?.displayName ?? connectionType} sub-node must be connected and enabled`,
 			);
 		}
 		return inputConfiguration.maxConnections === 1 ? undefined : [];
 	}
 
-	const constParentNodes = parentNodes
-		.map((nodeName) => {
-			return workflow.getNode(nodeName) as INode;
-		})
-		.filter((connectedNode) => connectedNode.disabled !== true)
-		.map(async (connectedNode) => {
-			const nodeType = workflow.nodeTypes.getByNameAndVersion(
-				connectedNode.type,
-				connectedNode.typeVersion,
-			);
-			const context = new SupplyDataContext(
+	if (
+		inputConfiguration.maxConnections !== undefined &&
+		connectedNodes.length > inputConfiguration.maxConnections
+	) {
+		throw new NodeOperationError(
+			parentNode,
+			`Only ${inputConfiguration.maxConnections} ${connectionType} sub-nodes are/is allowed to be connected`,
+		);
+	}
+
+	const nodes: SupplyData[] = [];
+	for (const connectedNode of connectedNodes) {
+		const connectedNodeType = workflow.nodeTypes.getByNameAndVersion(
+			connectedNode.type,
+			connectedNode.typeVersion,
+		);
+		const contextFactory = (runIndex: number, inputData: ITaskDataConnections) =>
+			new SupplyDataContext(
 				workflow,
 				connectedNode,
 				additionalData,
@@ -2220,29 +2102,33 @@ export async function getInputConnectionData(
 				runIndex,
 				connectionInputData,
 				inputData,
+				connectionType,
 				executeData,
 				closeFunctions,
 				abortSignal,
 			);
 
-			if (!nodeType.supplyData) {
-				if (nodeType.description.outputs.includes(NodeConnectionType.AiTool)) {
-					nodeType.supplyData = async function (this: ISupplyDataFunctions) {
-						return createNodeAsTool(this, nodeType, this.getNode().parameters);
-					};
-				} else {
-					throw new ApplicationError('Node does not have a `supplyData` method defined', {
-						extra: { nodeName: connectedNode.name },
-					});
-				}
+		if (!connectedNodeType.supplyData) {
+			if (connectedNodeType.description.outputs.includes(NodeConnectionType.AiTool)) {
+				const supplyData = createNodeAsTool({
+					node: connectedNode,
+					nodeType: connectedNodeType,
+					contextFactory,
+				});
+				nodes.push(supplyData);
+			} else {
+				throw new ApplicationError('Node does not have a `supplyData` method defined', {
+					extra: { nodeName: connectedNode.name },
+				});
 			}
-
+		} else {
+			const context = contextFactory(parentRunIndex, parentInputData);
 			try {
-				const response = await nodeType.supplyData.call(context, itemIndex);
-				if (response.closeFunction) {
-					closeFunctions.push(response.closeFunction);
+				const supplyData = await connectedNodeType.supplyData.call(context, itemIndex);
+				if (supplyData.closeFunction) {
+					closeFunctions.push(supplyData.closeFunction);
 				}
-				return response;
+				nodes.push(supplyData);
 			} catch (error) {
 				// Propagate errors from sub-nodes
 				if (error.functionality === 'configuration-node') throw error;
@@ -2253,20 +2139,16 @@ export async function getInputConnectionData(
 				}
 
 				let currentNodeRunIndex = 0;
-				if (runExecutionData.resultData.runData.hasOwnProperty(node.name)) {
-					currentNodeRunIndex = runExecutionData.resultData.runData[node.name].length;
+				if (runExecutionData.resultData.runData.hasOwnProperty(parentNode.name)) {
+					currentNodeRunIndex = runExecutionData.resultData.runData[parentNode.name].length;
 				}
 
 				// Display the error on the node which is causing it
-				await addExecutionDataFunctions(
+				await context.addExecutionDataFunctions(
 					'input',
-					connectedNode.name,
 					error,
-					runExecutionData,
-					inputName,
-					additionalData,
-					node.name,
-					runIndex,
+					connectionType,
+					parentNode.name,
 					currentNodeRunIndex,
 				);
 
@@ -2277,25 +2159,7 @@ export async function getInputConnectionData(
 					description: error.message,
 				});
 			}
-		});
-
-	// Validate the inputs
-	const nodes = await Promise.all(constParentNodes);
-
-	if (inputConfiguration.required && nodes.length === 0) {
-		throw new NodeOperationError(
-			node,
-			`A ${inputConfiguration?.displayName ?? inputName} sub-node must be connected`,
-		);
-	}
-	if (
-		inputConfiguration.maxConnections !== undefined &&
-		nodes.length > inputConfiguration.maxConnections
-	) {
-		throw new NodeOperationError(
-			node,
-			`Only ${inputConfiguration.maxConnections} ${inputName} sub-nodes are/is allowed to be connected`,
-		);
+		}
 	}
 
 	return inputConfiguration.maxConnections === 1

@@ -9,7 +9,7 @@
 import { GlobalConfig } from '@n8n/config';
 import type express from 'express';
 import get from 'lodash/get';
-import { BinaryDataService, NodeExecuteFunctions } from 'n8n-core';
+import { BinaryDataService, ErrorReporter, NodeExecuteFunctions } from 'n8n-core';
 import type {
 	IBinaryData,
 	IBinaryKeyData,
@@ -33,8 +33,6 @@ import {
 	ApplicationError,
 	BINARY_ENCODING,
 	createDeferredPromise,
-	ErrorReporterProxy as ErrorReporter,
-	ErrorReporterProxy,
 	ExecutionCancelledError,
 	FORM_NODE_TYPE,
 	NodeHelpers,
@@ -48,11 +46,12 @@ import type { Project } from '@/databases/entities/project';
 import { InternalServerError } from '@/errors/response-errors/internal-server.error';
 import { NotFoundError } from '@/errors/response-errors/not-found.error';
 import { UnprocessableRequestError } from '@/errors/response-errors/unprocessable.error';
-import type { IExecutionDb, IWorkflowDb } from '@/interfaces';
+import type { IWorkflowDb } from '@/interfaces';
 import { Logger } from '@/logging/logger.service';
 import { parseBody } from '@/middlewares';
 import { OwnershipService } from '@/services/ownership.service';
 import { WorkflowStatisticsService } from '@/services/workflow-statistics.service';
+import { WaitTracker } from '@/wait-tracker';
 import { createMultiFormDataParser } from '@/webhooks/webhook-form-data';
 import * as WorkflowExecuteAdditionalData from '@/workflow-execute-additional-data';
 import * as WorkflowHelpers from '@/workflow-helpers';
@@ -279,7 +278,7 @@ export async function executeWebhook(
 				errorMessage = err.message;
 			}
 
-			ErrorReporterProxy.error(err, {
+			Container.get(ErrorReporter).error(err, {
 				extra: {
 					nodeName: workflowStartNode.name,
 					nodeType: workflowStartNode.type,
@@ -520,7 +519,7 @@ export async function executeWebhook(
 					didSendResponse = true;
 				})
 				.catch(async (error) => {
-					ErrorReporter.error(error);
+					Container.get(ErrorReporter).error(error);
 					Container.get(Logger).error(
 						`Error with Webhook-Response for execution "${executionId}": "${error.message}"`,
 						{ executionId, workflowId: workflow.id },
@@ -548,11 +547,21 @@ export async function executeWebhook(
 			{ executionId },
 		);
 
+		const activeExecutions = Container.get(ActiveExecutions);
+
+		// Get a promise which resolves when the workflow did execute and send then response
+		const executePromise = activeExecutions.getPostExecutePromise(executionId);
+
+		const { parentExecution } = runExecutionData;
+		if (parentExecution) {
+			// on child execution completion, resume parent execution
+			void executePromise.then(() => {
+				const waitTracker = Container.get(WaitTracker);
+				void waitTracker.startExecution(parentExecution.executionId);
+			});
+		}
+
 		if (!didSendResponse) {
-			// Get a promise which resolves when the workflow did execute and send then response
-			const executePromise = Container.get(ActiveExecutions).getPostExecutePromise(
-				executionId,
-			) as Promise<IExecutionDb | undefined>;
 			executePromise
 				// eslint-disable-next-line complexity
 				.then(async (data) => {
